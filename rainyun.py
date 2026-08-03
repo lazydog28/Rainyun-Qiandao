@@ -3370,33 +3370,63 @@ def run_checkin(account_user=None, account_pwd=None, reuse_proxy=None):
             driver.switch_to.default_content()
             dismiss_modal_confirm(driver, timeout)
 
-            # 等待登录跳转完成：代理环境下响应较慢，用 WebDriverWait 轮询 URL 变化，
-            # 最长等待 30 秒，避免 time.sleep(5) 不够导致误判为"账号密码错误"
+            # 等待登录结果：轮询同时检测 URL 跳转（成功）和页面错误提示（密码错误）
+            # 账号密码错误时 API 快速返回错误 → 页面显示错误提示文字
+            # 代理过慢时请求未完成 → 页面既不跳转也无错误提示
+            def _check_login_result(d):
+                """返回 'success' / 'error' / None（继续等待）"""
+                if "/dashboard" in d.current_url or "/account" in d.current_url:
+                    return "success"
+                try:
+                    body_text = d.find_element(By.TAG_NAME, "body").text
+                    error_keywords = ("密码错误", "账号不存在", "用户名或密码", "登录失败",
+                                     "账户或密码", "账号或密码", "验证失败")
+                    if any(kw in body_text for kw in error_keywords):
+                        return "error"
+                except Exception:
+                    pass
+                return None
+
             try:
-                WebDriverWait(driver, 30).until(
-                    lambda d: "/dashboard" in d.current_url or "/account" in d.current_url
-                )
-                logger_adapter.info("登录成功！")
-                save_cookies(driver, current_user)
-                # 跳转到积分页
-                driver.get("https://app.rainyun.com/account/reward/earn")
-                time.sleep(2)
+                login_outcome = WebDriverWait(driver, 30).until(_check_login_result)
+                if login_outcome == "success":
+                    logger_adapter.info("登录成功！")
+                    save_cookies(driver, current_user)
+                    driver.get("https://app.rainyun.com/account/reward/earn")
+                    time.sleep(2)
+                else:
+                    # 页面显示了错误提示 → 账号密码错误，非代理问题
+                    fail_reason = "账号或密码错误（登录页显示错误提示），请检查环境变量/GitHub Secrets 中的 RAINYUN_USERNAME / RAINYUN_PASSWORD"
+                    logger_adapter.error(f"登录失败: {fail_reason}")
+                    screenshot_path = save_screenshot(driver, current_user, status="failure")
+                    return {
+                        'status': False, 'msg': fail_reason, 'points': 0,
+                        'username': f"{current_user[:3]}***{current_user[-3:] if len(current_user) > 6 else current_user}",
+                        'retries': retry_stats['count'], 'screenshot': screenshot_path,
+                        'proxy': proxy, 'proxy_failed': False
+                    }
             except TimeoutException:
-                # 区分失败原因：仍在登录页通常是账号密码错误或代理过慢导致登录超时
+                # 30秒内既没有跳转也没有错误提示 → 登录请求未完成 → 代理过慢
                 if "/auth/login" in driver.current_url:
                     if current_user in ("username", "") or current_pwd in ("password", ""):
                         fail_reason = "未配置雨云账号密码（请检查环境变量/GitHub Secrets: RAINYUN_USERNAME / RAINYUN_PASSWORD）"
+                        is_proxy_fail = False
+                    elif proxy:
+                        fail_reason = "代理过慢导致登录超时（30秒内无跳转且无错误提示），已标记代理失败将换新代理重试"
+                        is_proxy_fail = True
                     else:
-                        fail_reason = "账号或密码错误，或代理过慢导致登录超时（仍在登录页），请检查环境变量/GitHub Secrets 中的 RAINYUN_USERNAME / RAINYUN_PASSWORD"
+                        fail_reason = "登录超时（30秒内无跳转且无错误提示），请检查网络或账号密码"
+                        is_proxy_fail = False
                 else:
                     fail_reason = f"登录后跳转异常（当前页面: {driver.current_url}）"
+                    is_proxy_fail = False
                 logger_adapter.error(f"登录失败: {fail_reason}")
                 screenshot_path = save_screenshot(driver, current_user, status="failure")
                 return {
                     'status': False, 'msg': fail_reason, 'points': 0,
                     'username': f"{current_user[:3]}***{current_user[-3:] if len(current_user) > 6 else current_user}",
                     'retries': retry_stats['count'], 'screenshot': screenshot_path,
-                    'proxy': proxy, 'proxy_failed': True
+                    'proxy': proxy, 'proxy_failed': is_proxy_fail
                 }
         else:
             logger_adapter.info("Cookie 有效，免密登录成功！🎉")
