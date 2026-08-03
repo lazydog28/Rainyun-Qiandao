@@ -3199,10 +3199,13 @@ def load_cookies(driver, account_id):
         logger.info(f"已加载本地 Cookie")
         return True
     except Exception as e:
-        # 代理异常（ERR_PROXY_CONNECTION_FAILED 等）会抛 WebDriverException，
-        # 需要向上传播以便调用方区分"代理失败"和"Cookie 文件缺失"
+        # 代理异常（ERR_PROXY_CONNECTION_FAILED、ERR_CONNECTION_RESET、renderer 超时等）
+        # 会抛 WebDriverException，需要向上传播以便调用方区分"代理失败"和"Cookie 文件缺失"
         error_msg = str(e)
-        if "ERR_PROXY" in error_msg or "ERR_INTERNET_DISCONNECTED" in error_msg or "ERR_NAME_NOT_RESOLVED" in error_msg:
+        if any(kw in error_msg for kw in (
+            "ERR_PROXY", "ERR_INTERNET_DISCONNECTED", "ERR_NAME_NOT_RESOLVED",
+            "ERR_CONNECTION", "ERR_TIMED_OUT", "Timed out receiving message from renderer"
+        )):
             logger.warning(f"加载 Cookie 时代理连接失败: {e}")
             raise
         logger.warning(f"加载 Cookie 失败: {e}")
@@ -3308,7 +3311,7 @@ def run_checkin(account_user=None, account_pwd=None, reuse_proxy=None):
             time.sleep(3)
         except WebDriverException as e:
             error_msg = str(e)
-            if any(kw in error_msg for kw in ("ERR_PROXY", "ERR_INTERNET_DISCONNECTED", "ERR_NAME_NOT_RESOLVED", "ERR_TIMED_OUT", "ERR_CONNECTION")):
+            if any(kw in error_msg for kw in ("ERR_PROXY", "ERR_INTERNET_DISCONNECTED", "ERR_NAME_NOT_RESOLVED", "ERR_TIMED_OUT", "ERR_CONNECTION", "Timed out receiving message from renderer")):
                 logger_adapter.error(f"代理连接失败，页面无法加载: {error_msg[:200]}")
                 screenshot_path = save_screenshot(driver, current_user, status="failure")
                 return {
@@ -3504,8 +3507,14 @@ def run_checkin(account_user=None, account_pwd=None, reuse_proxy=None):
             
     except Exception as e:
         error_msg = str(e)
-        # 判断异常是否由代理引起（ERR_PROXY_CONNECTION_FAILED 等）
-        is_proxy_error = any(kw in error_msg for kw in ("ERR_PROXY", "ERR_INTERNET_DISCONNECTED", "ERR_NAME_NOT_RESOLVED", "ERR_TIMED_OUT", "ERR_CONNECTION"))
+        # 判断异常是否由代理引起（ERR_PROXY_CONNECTION_FAILED、renderer 超时等）
+        is_proxy_error = any(kw in error_msg for kw in (
+            "ERR_PROXY", "ERR_INTERNET_DISCONNECTED", "ERR_NAME_NOT_RESOLVED",
+            "ERR_TIMED_OUT", "ERR_CONNECTION", "Timed out receiving message from renderer"
+        ))
+        # 代理环境下，元素找不到通常是代理过慢导致页面 JS 未完整渲染
+        if proxy and not is_proxy_error and "no such element" in error_msg.lower():
+            is_proxy_error = True
         logger_adapter.error(f"签到任务执行失败: {e}")
         import traceback
         logger_adapter.error(f"详细错误信息: {traceback.format_exc()}")
