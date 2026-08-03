@@ -78,6 +78,7 @@ def import_selenium_modules():
         from selenium.webdriver.support import expected_conditions as EC
         from selenium.webdriver.support.wait import WebDriverWait
         from selenium.common import TimeoutException
+        from selenium.common.exceptions import WebDriverException
         
         selenium_modules = {
             'webdriver': webdriver,
@@ -88,7 +89,8 @@ def import_selenium_modules():
             'By': By,
             'EC': EC,
             'WebDriverWait': WebDriverWait,
-            'TimeoutException': TimeoutException
+            'TimeoutException': TimeoutException,
+            'WebDriverException': WebDriverException
         }
     return selenium_modules
 
@@ -941,39 +943,47 @@ def parse_proxy_response(response_text):
     return None
 
 
-def validate_proxy(proxy, timeout=10):
+def validate_proxy(proxy, timeout=5, max_response_time=3):
     """
-    测试代理是否可用
+    测试代理是否可用且响应足够快。
+    仅能连通不够——浏览器会话需要加载多个资源，慢代理会导致页面加载不完整、
+    Cookie 无法正确送达服务器，进而被误判为"Cookie 失效"。
     :param proxy: 代理地址，格式为 ip:port
-    :param timeout: 超时时间（秒）
+    :param timeout: 请求超时时间（秒）
+    :param max_response_time: 最大允许响应时间（秒），超过则认为代理过慢
     :return: True 可用，False 不可用
     """
     import requests
-    
+
     if not proxy:
         return False
-    
+
     try:
         test_proxies = {
             "http": f"http://{proxy}",
             "https": f"http://{proxy}"
         }
-        
+
         # 使用 app.rainyun.com 测试代理连通性（这是实际被海外 IP 拦截的目标域名）
         logger.info(f"正在验证代理 {proxy} 的可用性...")
+        start_time = time.time()
         response = requests.get(
             "https://app.rainyun.com/",
             proxies=test_proxies,
             timeout=timeout
         )
-        
+        elapsed = time.time() - start_time
+
         if response.status_code == 200:
-            logger.info(f"代理 {proxy} 验证成功")
+            if elapsed > max_response_time:
+                logger.warning(f"代理 {proxy} 响应过慢（{elapsed:.1f}s > {max_response_time}s），放弃使用")
+                return False
+            logger.info(f"代理 {proxy} 验证成功（响应时间 {elapsed:.1f}s）")
             return True
         else:
             logger.warning(f"代理验证失败，状态码: {response.status_code}")
             return False
-            
+
     except requests.Timeout:
         logger.warning(f"代理 {proxy} 验证超时")
         return False
@@ -1020,9 +1030,14 @@ def get_freeproxy_ip():
         )
 
         def _is_valid(resp):
-            # 能拿到 200 响应即证明代理可连 app.rainyun.com 并绕过海外 IP 拦截
+            # 能拿到 200 响应且响应够快，才证明代理可用于浏览器会话。
+            # 慢代理（>3s）会导致页面加载不完整、Cookie 无法送达，被误判为"Cookie 失效"。
             try:
-                return resp.status_code == 200
+                if resp.status_code != 200:
+                    return False
+                if resp.elapsed.total_seconds() > 3:
+                    return False
+                return True
             except Exception:
                 return False
 
@@ -1030,7 +1045,7 @@ def get_freeproxy_ip():
             test_url="https://app.rainyun.com/",
             need=1,
             source_timeout=15,
-            validate_timeout=10,
+            validate_timeout=5,
             validate_workers=64,
             method="GET",
             is_valid=_is_valid,
@@ -1603,10 +1618,15 @@ def run_all_accounts():
                 retry_info = f"（第 {results[username]['retry_count'] + 1} 次尝试）" if results[username]['retry_count'] > 0 else ""
                 logger.info(f"========== 启动账号 {account_idx}/{len(accounts)} {retry_info} ==========")
 
-                # 重试时复用上次代理，避免换 IP 导致 Cookie 失效
+                # 重试时复用上次代理，避免换 IP 导致 Cookie 失效。
+                # 但如果上次失败是代理问题（proxy_failed），则不复用——慢代理通过了 validate_proxy
+                # 却无法支撑浏览器会话，复用只会重复同样的失败。
                 reuse_proxy = None
                 if results[username]['result'] and results[username]['result'].get('proxy'):
-                    reuse_proxy = results[username]['result']['proxy']
+                    if not results[username]['result'].get('proxy_failed'):
+                        reuse_proxy = results[username]['result']['proxy']
+                    else:
+                        logger.info(f"上次失败由代理引起，不复用旧代理，重新抓取")
 
                 future = executor.submit(run_checkin, username, password, reuse_proxy)
                 future_to_account[future] = username
@@ -1796,12 +1816,17 @@ def init_selenium(account_id: str, proxy: str = None):
             logger.info("使用 Selenium Manager 自动管理 ChromeDriver")
             service = Service()
         
-        return webdriver.Chrome(service=service, options=ops)
+        driver = webdriver.Chrome(service=service, options=ops)
+        # 限制页面加载时间：慢代理下防止 driver.get() 无限阻塞
+        driver.set_page_load_timeout(30)
+        return driver
     else:
         # Windows 环境
         # 使用 Selenium Manager 自动处理驱动下载和路径匹配
         service = Service()
-        return webdriver.Chrome(service=service, options=ops)
+        driver = webdriver.Chrome(service=service, options=ops)
+        driver.set_page_load_timeout(30)
+        return driver
 
 
 def download_image(url, filename, user_agent=None):
@@ -3174,6 +3199,12 @@ def load_cookies(driver, account_id):
         logger.info(f"已加载本地 Cookie")
         return True
     except Exception as e:
+        # 代理异常（ERR_PROXY_CONNECTION_FAILED 等）会抛 WebDriverException，
+        # 需要向上传播以便调用方区分"代理失败"和"Cookie 文件缺失"
+        error_msg = str(e)
+        if "ERR_PROXY" in error_msg or "ERR_INTERNET_DISCONNECTED" in error_msg or "ERR_NAME_NOT_RESOLVED" in error_msg:
+            logger.warning(f"加载 Cookie 时代理连接失败: {e}")
+            raise
         logger.warning(f"加载 Cookie 失败: {e}")
         return False
 
@@ -3191,6 +3222,7 @@ def run_checkin(account_user=None, account_pwd=None, reuse_proxy=None):
     EC = modules['EC']
     WebDriverWait = modules['WebDriverWait']
     TimeoutException = modules['TimeoutException']
+    WebDriverException = modules['WebDriverException']
     import subprocess
     
     current_user = account_user or user
@@ -3266,13 +3298,41 @@ def run_checkin(account_user=None, account_pwd=None, reuse_proxy=None):
         wait = WebDriverWait(driver, timeout)
         
         # 加载 Cookie 并直接跳转积分页
-        load_cookies(driver, current_user)
-        logger_adapter.info("正在跳转积分页...")
-        driver.get("https://app.rainyun.com/account/reward/earn")
-        time.sleep(3)
+        # 慢代理或断连会导致 driver.get() 抛 WebDriverException（ERR_PROXY_CONNECTION_FAILED 等），
+        # 需要捕获并标记为代理失败，让重试机制换新代理而非复用旧代理。
+        proxy_failed = False
+        try:
+            load_cookies(driver, current_user)
+            logger_adapter.info("正在跳转积分页...")
+            driver.get("https://app.rainyun.com/account/reward/earn")
+            time.sleep(3)
+        except WebDriverException as e:
+            error_msg = str(e)
+            if any(kw in error_msg for kw in ("ERR_PROXY", "ERR_INTERNET_DISCONNECTED", "ERR_NAME_NOT_RESOLVED", "ERR_TIMED_OUT", "ERR_CONNECTION")):
+                logger_adapter.error(f"代理连接失败，页面无法加载: {error_msg[:200]}")
+                screenshot_path = save_screenshot(driver, current_user, status="failure")
+                return {
+                    'status': False, 'msg': '代理连接失败，页面无法加载', 'points': 0,
+                    'username': f"{current_user[:3]}***{current_user[-3:] if len(current_user) > 6 else current_user}",
+                    'retries': retry_stats['count'], 'screenshot': screenshot_path,
+                    'proxy': proxy, 'proxy_failed': True
+                }
+            raise
         
         # 检查是否需要密码登录
         if "/auth/login" in driver.current_url:
+            # 慢代理下页面可能加载不完整就被重定向到 /auth/login，
+            # 需要确认登录表单是否真正渲染——如果页面源码过短说明页面没加载完，是代理问题。
+            page_src = driver.page_source or ""
+            if len(page_src) < 500:
+                logger_adapter.error(f"页面加载不完整（源码仅 {len(page_src)} 字符），疑似代理过慢")
+                screenshot_path = save_screenshot(driver, current_user, status="failure")
+                return {
+                    'status': False, 'msg': '代理过慢导致页面加载不完整', 'points': 0,
+                    'username': f"{current_user[:3]}***{current_user[-3:] if len(current_user) > 6 else current_user}",
+                    'retries': retry_stats['count'], 'screenshot': screenshot_path,
+                    'proxy': proxy, 'proxy_failed': True
+                }
             logger_adapter.info("Cookie 已失效，使用账号密码登录")
             
             try:
@@ -3284,13 +3344,14 @@ def run_checkin(account_user=None, account_pwd=None, reuse_proxy=None):
                 password.send_keys(current_pwd)
                 login_button.click()
             except TimeoutException:
-                logger_adapter.error("页面加载超时")
+                # 登录表单元素超时未找到：通常是代理太慢导致 JS bundle 没下载完，页面没渲染
+                logger_adapter.error("登录表单加载超时，疑似代理过慢导致页面未渲染完成")
                 screenshot_path = save_screenshot(driver, current_user, status="failure")
                 return {
-                    'status': False, 'msg': '页面加载超时', 'points': 0,
+                    'status': False, 'msg': '代理过慢导致登录表单加载超时', 'points': 0,
                     'username': f"{current_user[:3]}***{current_user[-3:] if len(current_user) > 6 else current_user}",
                     'retries': retry_stats['count'], 'screenshot': screenshot_path,
-                    'proxy': proxy
+                    'proxy': proxy, 'proxy_failed': True
                 }
             
             # 处理登录验证码
@@ -3332,7 +3393,7 @@ def run_checkin(account_user=None, account_pwd=None, reuse_proxy=None):
                     'status': False, 'msg': fail_reason, 'points': 0,
                     'username': f"{current_user[:3]}***{current_user[-3:] if len(current_user) > 6 else current_user}",
                     'retries': retry_stats['count'], 'screenshot': screenshot_path,
-                    'proxy': proxy
+                    'proxy': proxy, 'proxy_failed': True
                 }
         else:
             logger_adapter.info("Cookie 有效，免密登录成功！🎉")
@@ -3442,6 +3503,9 @@ def run_checkin(account_user=None, account_pwd=None, reuse_proxy=None):
         }
             
     except Exception as e:
+        error_msg = str(e)
+        # 判断异常是否由代理引起（ERR_PROXY_CONNECTION_FAILED 等）
+        is_proxy_error = any(kw in error_msg for kw in ("ERR_PROXY", "ERR_INTERNET_DISCONNECTED", "ERR_NAME_NOT_RESOLVED", "ERR_TIMED_OUT", "ERR_CONNECTION"))
         logger_adapter.error(f"签到任务执行失败: {e}")
         import traceback
         logger_adapter.error(f"详细错误信息: {traceback.format_exc()}")
@@ -3456,7 +3520,8 @@ def run_checkin(account_user=None, account_pwd=None, reuse_proxy=None):
             'username': f"{current_user[:3]}***{current_user[-3:] if len(current_user) > 6 else current_user}",
             'retries': retry_stats['count'],
             'screenshot': screenshot_path,
-            'proxy': proxy
+            'proxy': proxy,
+            'proxy_failed': is_proxy_error
         }
     finally:
         # 确保在任何情况下都关闭 WebDriver
